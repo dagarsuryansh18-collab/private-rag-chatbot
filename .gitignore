@@ -1,0 +1,7 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+private_vector_db/
+uploaded_pdfs/
