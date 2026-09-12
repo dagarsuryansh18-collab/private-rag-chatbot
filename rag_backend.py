@@ -35,6 +35,7 @@ pip install langchain langchain-community langchain-huggingface langchain-chroma
 
 import os
 import logging
+import hashlib
 from typing import Optional, List
 
 # --- LangChain / Chroma / HuggingFace imports (current, non-deprecated paths) ---
@@ -59,9 +60,10 @@ except ImportError as e:
 # --------------------------------------------------------------------------------
 PERSIST_DIRECTORY: str = "./private_vector_db"
 EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE: int = 500
-CHUNK_OVERLAP: int = 50
-TOP_K: int = 3
+CHUNK_SIZE: int = 700
+CHUNK_OVERLAP: int = 100
+TOP_K: int = 8
+RETRIEVAL_FETCH_K: int = 24
 COLLECTION_NAME: str = "private_knowledge_base"
 
 # --------------------------------------------------------------------------------
@@ -205,10 +207,13 @@ def ingest_pdf(pdf_path: str) -> Optional[int]:
         logger.warning(f"Splitting produced zero chunks for '{pdf_path}'.")
         return None
 
-    # Tag each chunk with its source filename for traceability in the UI
+    # Tag each chunk with its source filename for traceability in the UI.
+    # Also attach a deterministic chunk ID so re-ingesting the same PDF can
+    # replace the same logical chunks instead of creating endless duplicates.
     source_name = os.path.basename(pdf_path)
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         chunk.metadata["source_file"] = source_name
+        chunk.metadata["chunk_index"] = index
 
     # --- 4. Prepare embedding model ---
     try:
@@ -231,7 +236,13 @@ def ingest_pdf(pdf_path: str) -> Optional[int]:
             embedding_function=embeddings,
             persist_directory=PERSIST_DIRECTORY,
         )
-        vector_store.add_documents(documents=chunks)
+        chunk_ids = [
+            hashlib.sha256(
+                f"{source_name}:{chunk.metadata.get('page', 'N/A')}:{chunk.metadata.get('chunk_index', i)}:{chunk.page_content}".encode("utf-8")
+            ).hexdigest()
+            for i, chunk in enumerate(chunks)
+        ]
+        vector_store.add_documents(documents=chunks, ids=chunk_ids)
     except Exception as e:
         logger.error(f"Failed to embed/persist chunks into Chroma DB. "
                       f"Check disk space and write permissions on "
@@ -249,7 +260,7 @@ def ingest_pdf(pdf_path: str) -> Optional[int]:
 def get_local_retriever(k: int = TOP_K) -> Optional[VectorStoreRetriever]:
     """
     Load the persisted local Chroma vector database and return a retriever
-    instance ready for similarity search (e.g. inside a RAG chain or a
+    instance ready for diverse MMR search (e.g. inside a RAG chain or a
     Streamlit query handler).
 
     Args:
@@ -309,8 +320,12 @@ def get_local_retriever(k: int = TOP_K) -> Optional[VectorStoreRetriever]:
     # --- 5. Build and return retriever ---
     try:
         retriever = vector_store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": k},
+            search_type="mmr",
+            search_kwargs={
+                "k": k,
+                "fetch_k": max(RETRIEVAL_FETCH_K, k * 3),
+                "lambda_mult": 0.7,
+            },
         )
         return retriever
     except Exception as e:
